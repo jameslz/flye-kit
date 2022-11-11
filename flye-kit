@@ -1,0 +1,316 @@
+#!/usr/bin/perl -w
+
+use strict;
+use warnings;
+use Getopt::Std;
+use File::Basename;
+use Cwd 'abs_path';
+
+my $version = "0.0.1";
+
+my %opts = (1 => '',
+            2 => '',
+            l => '',
+            q => '',
+            n => '',
+            g => '',
+            o => '',
+            p => '',
+            g => '',
+            t => 40,
+            r => 2);
+
+getopts('1:2:l:q:n:o:p:g:t:r:h', \%opts);
+
+my  $stamp          =  "";
+my  %type_h         =  qw/pacbio-raw map-pb pacbio-corr map-pb pacbio-hifi map-hifi nano-raw map-ont nano-corr map-ont nano-hq map-ont/;
+inspect();
+
+my  $cpus           =  $opts{t};
+my  $project_home   =  $opts{o};
+
+my  $runs           =  qq{$project_home/runs};
+my  $flye           =  qq{$project_home/flye};
+my  $pilon          =  qq{$project_home/pilon};
+my  $report         =  qq{$project_home/report};
+my  $binaries       =  dirname( abs_path($0) ) . '/binaries';
+
+submit();
+
+exit;
+
+sub timestamp {
+
+    my ($sec, $min, $hour, $mday, $mon, $year, $wday, $yday, $isdst) = localtime();
+    $stamp = sprintf("%04d-%02d-%02d %02d:%02d", $year + 1900, $mon, $mday, $hour, $min);
+
+}
+
+sub inspect{
+
+    if ( $opts{h} ){
+        &usage;
+        exit;
+    }
+
+    my $num = 0;
+
+    timestamp();
+    print STDERR qq{\n\n[$stamp] INFO: parameter list:\n\n};
+    
+    # parameter
+    foreach my $para ( qw/1 2 l q n g o p t r/ ) {
+        
+        if( $para eq 'p'){
+            print qq{parameter: $para: $opts{ $para }\n};
+            next;
+        }
+
+        if( $opts{ $para } ne "" ){
+            print qq{parameter: $para: $opts{ $para }\n};
+        }else{
+            $num++;
+            print STDERR qq{parameter: $para: \e[1;45mNot available.\e[0m \n};
+        }
+    }
+    
+    if($num){
+        print STDERR qq{\n\n[ERR]: abort. Please check parameters.\n};
+        print STDERR qq{flye-kit -h for help..\n\n};
+
+        &usage;
+
+        exit;
+    }
+
+    # output path
+    if(-e $opts{o}){
+        print STDERR qq{\n\n[ERR]: Output directory exist.\n\n\n};
+        exit;
+    }
+
+    # long reads type
+    
+    if(!exists $type_h{ $opts{q}} ){
+        print STDERR qq{\n\n[ERR]: $opts{q} not supported.\n\n};
+        exit;
+    }
+
+    foreach my $para ( qw/1 2 l/ ) {
+        if( ! -e $opts{ $para } ){
+            print STDERR qq{\n\n[ERR]: can't open reads: $opts{ $para }.\n\n};
+            exit;
+        }
+    }   
+
+    timestamp();
+    print STDERR qq{\n\n[$stamp] INFO: Assembly Start.\n\n};
+
+}
+
+sub submit {
+
+    make_fs();
+    flye_run();
+    polish_run();
+    auxiliary_run();
+
+}
+
+sub make_fs {
+
+    my $cmd = qq{mkdir -p $runs
+                          $pilon
+                          $flye
+                          $report};
+       $cmd =~ s/\n\s+/ /msg;
+    system $cmd;
+
+}
+
+sub flye_run {
+
+    my $sh    =  qq{$runs/flye.sh};
+    open (EXPORT, ">$sh") || die "[ERR]: can't open $sh $!\n";
+
+    print EXPORT flye();
+
+    close EXPORT;
+    system qq{bash $sh};
+
+}
+
+sub flye {
+
+    my $cmd     = qq{flye                          \
+                        --threads $cpus            \
+                        --genome-size $opts{g}     \
+                        --$opts{q} $opts{l}        \
+                        -o $flye                   \
+                        $opts{p};\n};
+       $cmd     =~ s/\s+\n\s+/ /msg; 
+    
+    timestamp();
+    print STDERR qq{[$stamp] CMD: $cmd};
+    
+    return $cmd;
+
+}
+
+sub polish_run {
+
+    my $sh = qq{$runs/polish.sh};
+    open (EXPORT, ">$sh") || die "[ERR]: can't open $sh $!\n";
+
+    timestamp();
+    print STDERR qq{\n\n[$stamp] INFO: polish start.\n\n};
+
+    foreach my $r ( 1 .. $opts{r} ) {
+
+        my $round  = qq{round$r};
+        print EXPORT qq{mkdir -p $pilon/$round/index/;\n};
+        
+        if( $r == 1){
+            print EXPORT qq{cp $flye/assembly.fasta $pilon/$round/assembly.fasta;\n};
+        }else{
+            my $asm  = sprintf("$pilon/round%d/pilon_round%d.fasta", $r - 1, $r - 1);
+            print EXPORT qq{cp $asm $pilon/$round/assembly.fasta;\n};
+        }
+
+        my $genome = qq{$pilon/$round/assembly.fasta};
+        print EXPORT bwa_index( $genome, $round );
+        print EXPORT bwa_mem( $genome, $round );
+        print EXPORT qq{$binaries/samtools index $pilon/$round/short_reads.bam ;\n};
+        print EXPORT minimap2( $genome, $round );
+        print EXPORT qq{$binaries/samtools index $pilon/$round/long_reads.bam ;\n};
+        print EXPORT pilon( $genome, $round );
+
+    }
+
+    timestamp();
+    print STDERR qq{\n\n[$stamp] INFO: polish finished.\n\n};
+
+    close EXPORT;
+    system qq{bash $sh};
+
+}
+
+sub bwa_index {
+
+    my $genome = shift;
+    my $round  = shift;
+    my $cmd    = qq{$binaries/bwa index                \
+                       -p $pilon/$round/index/assembly \
+                       $genome;\n};
+       $cmd     =~ s/\s+\n\s+/ /msg; 
+    return $cmd;
+
+}
+
+sub bwa_mem {
+
+    my $genome = shift;
+    my $round  = shift;
+    my $cmd    = qq{$binaries/bwa mem                  \
+                       -t $cpus                        \
+                       $pilon/$round/index/assembly    \
+                       $opts{1}  $opts{2}              \
+                    |samtools view - -Sb               \
+                    |samtools sort - -\@$cpus          \
+                        -o $pilon/$round/short_reads.bam ;\n};
+       $cmd     =~ s/\s+\n\s+/ /msg; 
+    return $cmd;
+
+}
+
+sub minimap2 {
+
+    my $genome = shift;
+    my $round  = shift;
+    my $cmd     = qq{$binaries/minimap2                \
+                        -x $type_h{ $opts{q} }         \
+                        -a $genome                     \
+                        $opts{l}                       \
+                    |samtools view - -Sb               \
+                    |samtools sort - -\@$cpus          \
+                        -o $pilon/$round/long_reads.bam ;\n};
+       $cmd     =~ s/\s+\n\s+/ /msg; 
+    return $cmd;
+
+}
+
+sub pilon {
+
+    my $genome = shift;
+    my $round  = shift;
+    my $cmd     = qq{pilon                                     \
+                       --genome $genome                        \
+                       --fix all                               \
+                       --debug                                 \
+                       --changes                               \
+                       --vcf                                   \
+                       --tracks                                \
+                       --frags $pilon/$round/short_reads.bam   \
+                       --nanopore $pilon/$round/long_reads.bam \
+                       --output $pilon/$round/pilon_$round     \
+                    |tee $pilon/$round/pilon_$round.log;\n};
+       $cmd     =~ s/\s+\n\s+/ /msg; 
+    return $cmd;
+
+}
+
+sub auxiliary_run {
+
+    my $sh =  qq{$runs/auxiliary.sh}; 
+    open (EXPORT, ">$sh") || die "[ERR]: can't open $sh $!\n";
+
+
+    print EXPORT  asm();
+
+    timestamp();
+    print STDERR qq{\n\n[$stamp] INFO: Flye-kit finished.\n\n};
+
+    close EXPORT;
+    system qq{bash $sh};
+
+}
+
+sub asm {
+
+    my $round = qq{round$opts{r}};
+    my $cmd   = qq{$binaries/fastx-utils rename        \
+                      $pilon/$round/pilon_$round.fasta \
+                      $opts{n}                         \
+                   >$report/assembly.fasta ;\n};
+       $cmd     =~ s/\s+\n\s+/ /msg; 
+    return $cmd;
+
+
+}
+
+sub usage {
+
+    printf STDERR qq(
+
+Program: flye-kit: long reads assembly with Flye and Pilon.
+Version: $version
+Contact: ZHANG LEI <zhanglei\@logictek.cn>\n
+Usage:   flye-kit  [options]\n
+Options: 
+         -1 STR  FASTQ file of first short reads in each pair.  (required)
+         -2 STR  FASTQ file of second short reads in each pair. (required)
+         -l STR  FASTQ or FASTA file of long reads.  (required)
+         -q STR  long reads quality: pacbio-raw | pacbio-corr | pacbio-hifi |
+                                     nano-raw | nano-corr | nano-hq (required)
+         -n STR  strain name for sequence label.  (required)
+         -g STR  estimated genome size (for example, 5m or 2.6g), (required)
+         -o STR  Output directory (required)
+         -p STR  Other Flye parametes. default: [""]
+         -t INT  CPU number, default: [40]
+         -r INT  rounds for pilon polish, default: [2]
+
+
+);
+   exit;
+
+}
